@@ -50,6 +50,7 @@ from openpyxl.utils import get_column_letter
 # ── tkinter (standard library, ships with Python on Windows) ──
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
+from decimal import Decimal, ROUND_HALF_UP
 
 warnings.filterwarnings("ignore")
 
@@ -194,6 +195,7 @@ def load_activity_files(file_paths, log):
     activity["checkin_time"]  = pd.to_datetime(activity["checkin_time"],  errors="coerce")
     activity["checkout_time"] = pd.to_datetime(activity["checkout_time"], errors="coerce")
     activity["created_at"]    = pd.to_datetime(activity["created_at"],    errors="coerce")
+    activity["day_first_checkin"] = pd.to_datetime(activity["day_first_checkin"], errors="coerce")
 
     # Pre-compute visit duration in seconds from the H:M:S string column
     activity["visit_seconds"] = activity["visit_time_h_m_s"].apply(hms_to_seconds)
@@ -359,7 +361,11 @@ def evaluate_attendance_from_activity(activity_df, dh_target_map, log):
         target  = dh_target_map.get(dh_code, 30)   # fallback target = 30
 
         # ── Step 4: compare ──
-        attendance[(wallet, date)] = "P" if valid_count >= target * MIN_VISIT_ACHIEVE else "A"
+        attendance[(wallet, date)] = "P" if valid_count >= (target * MIN_VISIT_ACHIEVE) else "A"
+        
+
+
+
 
     return attendance, valid_counts
 
