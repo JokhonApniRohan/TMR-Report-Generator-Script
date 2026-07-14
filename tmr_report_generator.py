@@ -195,7 +195,6 @@ def load_activity_files(file_paths, log):
     activity["checkin_time"]  = pd.to_datetime(activity["checkin_time"],  errors="coerce")
     activity["checkout_time"] = pd.to_datetime(activity["checkout_time"], errors="coerce")
     activity["created_at"]    = pd.to_datetime(activity["created_at"],    errors="coerce")
-    activity["day_first_checkin"] = pd.to_datetime(activity["day_first_checkin"], errors="coerce")
 
     # Pre-compute visit duration in seconds from the H:M:S string column
     activity["visit_seconds"] = activity["visit_time_h_m_s"].apply(hms_to_seconds)
