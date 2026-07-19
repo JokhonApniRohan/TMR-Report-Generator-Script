@@ -23,6 +23,15 @@ FILE DESCRIPTIONS:
   - DH Wise Target File : Defines daily visit targets per Distribution House.
                           Columns: DH Code, Distributor House Name,
                                    Market type, Daily visit target
+  - Region Wise Salary  : Defines monthly total salary per Region.
+                          Columns: Region, Fixed Salary, Variable Salary,
+                                   Total Salary, Salary Month Day Count,
+                                   Daily Fixed Salary, Daily Variable Salary
+  - Leave Status File   : Approved TMR leaves (optional).
+                          Columns: SL, Wallet Number, TMR Name, DH Code,
+                                   Leave Type, Leave Day, Leave Start Day,
+                                   Leave End Day, Approver, Remarks
+                          Friday leaves are automatically cancelled.
 =============================================================================
 ATTENDANCE RULES:
   A TMR is marked PRESENT (P) on a day if:
@@ -67,7 +76,16 @@ BUSINESS_END         = time(19, 0, 0)   # field work ends at  07:00 PM
 MIN_VISIT_ACHIEVE    = 0.75        # 75% of daily target must be met for P
 
 # Market hour KPI target (same for everyone)
-MARKET_HOUR_TARGET_H = 8           # 8 hours per working day
+MARKET_HOUR_TARGET_H = 8           # 8 hours per working day (KPI rule)
+
+# Salary KPI weights (must sum to 1.0)
+KPI_WEIGHT_STRIKE    = 0.35   # Strike Rate Achievement%
+KPI_WEIGHT_FREQUENCY = 0.40   # Frequency Wise (Weekly Coverage) Achievement%
+KPI_WEIGHT_MKT_HOUR  = 0.25   # Market Hour Achievement%
+
+# Fixed charges applied to every TMR
+INTERNET_CHARGE      = 300    # BDT per month (flat)
+CASHOUT_CHARGE_PCT   = 0.01   # 1% of Total Salary
 
 # upay brand palette (used in the Excel output)
 C_BLUE   = "0054A5"
@@ -305,6 +323,258 @@ def load_dh_targets(file_path, log):
     return dh_target_map, dh_mtype_map
 
 
+def load_salary_file(file_path, report_end_date, log):
+    """
+    Load the Region Wise Salary file.
+
+    Expected columns (row 1 = headers, no blank header row):
+      Region               → region name (matches TMR region field)
+      Total Salary         → monthly gross salary for the region
+      Fixed Salary         → 70% of Total Salary  (or as defined)
+      Variable Salary      → 30% of Total Salary  (or as defined)
+      Salary Month Day Count → calendar days in the salary month
+      Daily Fixed Salary   → Fixed Salary / Salary Month Day Count
+      Daily Variable Salary→ Variable Salary / Salary Month Day Count
+
+    Since the uploaded file contains Excel formulas that reference an external
+    workbook, we recompute everything from the Total Salary column and the
+    calendar days of the report month so the generator is self-contained.
+
+    Returns:
+      salary_map : { region_name_lower → {
+                        'total_salary'        : float,
+                        'fixed_salary'        : float,
+                        'variable_salary'     : float,
+                        'month_day_count'     : int,
+                        'daily_fixed'         : float,
+                        'daily_variable'      : float,
+                    } }
+    """
+    log(f"  Loading Region Wise Salary: {os.path.basename(file_path)}")
+
+    df = pd.read_excel(file_path)
+    df.columns = df.columns.str.strip()
+
+    # Flexible column matching
+    col_map = {c.lower().replace(" ", "_"): c for c in df.columns}
+
+    def find_col(*candidates):
+        for c in candidates:
+            if c in col_map:
+                return col_map[c]
+        return None
+
+    region_col = find_col("region")
+    total_col  = find_col("total_salary", "totalsalary", "salary")
+
+    if not region_col or not total_col:
+        raise ValueError(
+            "Region Wise Salary file must have 'Region' and 'Total Salary' columns. "
+            f"Found: {list(df.columns)}"
+        )
+
+    # Determine salary month day count from the report's end date
+    # (number of calendar days in that month)
+    import calendar
+    month_day_count = calendar.monthrange(report_end_date.year, report_end_date.month)[1]
+
+    salary_map = {}
+    for _, row in df.iterrows():
+        region = str(row[region_col]).strip()
+        if not region or region.lower() == "nan":
+            continue
+        try:
+            total = float(row[total_col])
+        except (ValueError, TypeError):
+            continue
+
+        fixed    = total * 0.70
+        variable = total * 0.30
+        daily_fixed    = fixed    / month_day_count
+        daily_variable = variable / month_day_count
+
+        salary_map[region.lower()] = {
+            "total_salary":    total,
+            "fixed_salary":    fixed,
+            "variable_salary": variable,
+            "month_day_count": month_day_count,
+            "daily_fixed":     daily_fixed,
+            "daily_variable":  daily_variable,
+            "region_display":  region,          # original casing for display
+        }
+
+    log(f"  → {len(salary_map)} region salary entries loaded (month days = {month_day_count})")
+    return salary_map
+
+
+def compute_weekly_freq_achievement(activity_df, wallet, daily_target, join_date,
+                                     year, month, report_end_date=None):
+    """
+    Frequency Wise Achievement% — four fixed calendar bands, but with a
+    JOIN-DATE-AWARE, DYNAMIC weekly target per band.
+
+    The month is still split into the same four fixed bands as before:
+        Week 1 : day  1 –  7
+        Week 2 : day  8 – 14
+        Week 3 : day 15 – 21
+        Week 4 : day 22 – 28   (days 29-31 are not part of any band)
+
+    But each TMR's *effective* range within a band depends on when they
+    actually started (join_date = first date they appear in either the
+    daily activity or daily summary data):
+
+      • Band entirely BEFORE join_date  → band doesn't exist for this TMR;
+        it is skipped and excluded from the average (not counted as 0).
+      • Band entirely or partially AFTER join_date → effective range is
+        [max(band_start, join_date), band_end].
+      • The band end is also capped at report_end_date (if given), so a
+        band isn't given credit/target for days beyond the actual data.
+
+    Weekly target for a band = daily_target × (number of NON-FRIDAY days
+    in that band's effective range) — this replaces the old fixed
+    daily_target × 6.
+
+    Band achievement = unique_agents_visited_in_effective_range / weekly_target
+                        (capped at 1.0)
+    Final score      = average of only the bands that exist for this TMR.
+
+    Returns float in [0.0, 1.0].
+    """
+    if activity_df is None or activity_df.empty or not daily_target:
+        return 0.0
+
+    tmr = activity_df[activity_df["tmr_wallet"] == wallet]
+    if tmr.empty:
+        return 0.0
+
+    # Valid visits only (same filters as attendance)
+    valid = tmr[
+        (tmr["checkin_time"].dt.time  >= BUSINESS_START) &
+        (tmr["checkout_time"].dt.time <= BUSINESS_END)  &
+        (tmr["visit_seconds"] >= VISIT_MIN_SECONDS)     &
+        (tmr["visit_seconds"] <= VISIT_MAX_SECONDS)
+    ].copy()
+
+    if valid.empty:
+        return 0.0
+
+    valid["agent_wallet"] = valid["agent_wallet"].astype(str).str.strip()
+    valid["date"]         = pd.to_datetime(valid["date"]).dt.normalize()
+
+    join_ts = pd.Timestamp(join_date).normalize() if join_date is not None and pd.notna(join_date) else None
+    cap_ts  = pd.Timestamp(report_end_date).normalize() if report_end_date is not None and pd.notna(report_end_date) else None
+
+    bands = [(1, 7), (8, 14), (15, 21), (22, 28)]
+    achievements = []
+    for lo, hi in bands:
+        band_start = pd.Timestamp(year=year, month=month, day=lo)
+        band_end   = pd.Timestamp(year=year, month=month, day=hi)
+
+        if cap_ts is not None:
+            band_end = min(band_end, cap_ts)
+
+        eff_start = max(band_start, join_ts) if join_ts is not None else band_start
+
+        if eff_start > band_end:
+            # TMR hadn't joined yet during this band (or band is beyond
+            # the data range) → this week doesn't exist for them.
+            continue
+
+        band_dates   = pd.date_range(start=eff_start, end=band_end, freq="D")
+        working_days = sum(1 for d in band_dates if d.weekday() != 4)   # exclude Fridays
+
+        if working_days <= 0:
+            continue
+
+        weekly_target = daily_target * working_days
+
+        band_visits   = valid[(valid["date"] >= eff_start) & (valid["date"] <= band_end)]
+        unique_agents = band_visits["agent_wallet"].nunique()
+
+        achievements.append(min(unique_agents / weekly_target, 1.0))
+
+    if not achievements:
+        return 0.0
+
+    return round(sum(achievements) / len(achievements), 6)
+
+
+
+def load_leave_file(file_path, log):
+    """
+    Load the TMR National Leave Status file.
+
+    Structure: headers on row 3, data from row 4 onward, column B onward.
+    Columns: SL, Wallet Number, TMR Name, DH Code, Leave Type,
+             Leave Day, Leave Start Day, Leave End Day, Approver, Remarks
+
+    Rules:
+      • Expand each leave row into individual dates (Start → End inclusive).
+      • Drop any date that falls on a Friday (Fridays are already holidays).
+      • The effective leave day count per row = non-Friday dates in the range.
+      • Returns: { normalized_wallet → { date (Timestamp) → True } }
+        so callers can check leave per (wallet, date).
+    """
+    log(f"  Loading Leave file: {os.path.basename(file_path)}")
+
+    # Row 3 = headers, data starts row 4; column B onward (index 1)
+    df = pd.read_excel(file_path, header=2)          # 0-indexed: row index 2 = row 3
+    df = df.dropna(how="all")
+
+    # Flexible column matching
+    df.columns = [str(c).strip() for c in df.columns]
+    col_lower  = {c.lower().replace(" ", "_"): c for c in df.columns}
+
+    def fc(*candidates):
+        for c in candidates:
+            if c in col_lower:
+                return col_lower[c]
+        return None
+
+    wallet_col = fc("wallet_number", "wallet")
+    start_col  = fc("leave_start_day", "start_day", "start")
+    end_col    = fc("leave_end_day",   "end_day",   "end")
+
+    if not wallet_col or not start_col or not end_col:
+        raise ValueError(
+            f"Leave file must have Wallet Number, Leave Start Day, Leave End Day columns. "
+            f"Found: {list(df.columns)}"
+        )
+
+    leave_map = {}   # { normalized_wallet → set of Timestamps }
+
+    for _, row in df.iterrows():
+        wallet = str(row.get(wallet_col, "")).strip()
+        if not wallet or wallet.lower() == "nan":
+            continue
+        wallet = normalize_wallet(wallet)
+
+        start = row.get(start_col)
+        end   = row.get(end_col)
+        if pd.isna(start) or pd.isna(end):
+            continue
+
+        try:
+            start = pd.Timestamp(start).normalize()
+            end   = pd.Timestamp(end).normalize()
+        except Exception:
+            continue
+
+        # Expand to individual dates, drop Fridays
+        date_range = pd.date_range(start=start, end=end, freq="D")
+        valid_days = [d for d in date_range if d.weekday() != 4]  # 4 = Friday
+
+        if not valid_days:
+            continue
+
+        if wallet not in leave_map:
+            leave_map[wallet] = set()
+        leave_map[wallet].update(valid_days)
+
+    total_entries = sum(len(v) for v in leave_map.values())
+    log(f"  → {len(leave_map)} TMRs with approved leave | {total_entries} total leave days")
+    return leave_map
+
 # =============================================================================
 # SECTION 4: ATTENDANCE EVALUATION
 # =============================================================================
@@ -373,7 +643,7 @@ def evaluate_attendance_from_activity(activity_df, dh_target_map, log):
 # SECTION 5: REPORT BUILDER
 # =============================================================================
 
-def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
+def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log, leave_map=None):
     """
     Combines all data sources and computes every column in the output report.
 
@@ -417,9 +687,8 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
     log(f"\n  Period: {report_start.date()} → {report_end.date()}")
     log(f"  Dates with data: {len(all_dates)}")
 
-    # ── Period-level metrics (same for every TMR) ──
-    mtd_work_days    = count_working_days(report_start, report_end)
-    friday_count     = count_fridays(report_start, report_end)
+    # NOTE: MTD Work Day / Friday Count are now computed PER-TMR (below, inside
+    # the row loop) from each TMR's own join date, not from this global range.
     total_month_days = (report_end - report_start).days + 1
 
     # ── Evaluate attendance from activity data ──
@@ -440,7 +709,10 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
                 # If same TMR appears twice for same date (edge case), keep last
                 summary_lookup[(str(w), pd.Timestamp(d))] = row
 
-    # ── Track each TMR's first available summary date (for per-TMR report start) ──
+    # ── Track each TMR's first available date across BOTH the daily activity
+    #    and daily summary data — this is treated as their "join date" and is
+    #    used both for the per-TMR report start and for the dynamic,
+    #    join-date-aware weekly frequency-achievement targets below. ──
     tmr_first_summary_date = {}
     if not summary_df.empty:
         for _, row in summary_df.iterrows():
@@ -451,6 +723,23 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
             d = pd.Timestamp(d).normalize()
             if w not in tmr_first_summary_date or d < tmr_first_summary_date[w]:
                 tmr_first_summary_date[w] = d
+
+    tmr_first_activity_date = {}
+    if not activity_df.empty:
+        for _, row in activity_df.iterrows():
+            w = str(row.get("tmr_wallet", "")).strip()
+            d = row.get("date")
+            if not w or pd.isna(d):
+                continue
+            d = pd.Timestamp(d).normalize()
+            if w not in tmr_first_activity_date or d < tmr_first_activity_date[w]:
+                tmr_first_activity_date[w] = d
+
+    tmr_join_date = {}
+    for w in set(tmr_first_summary_date) | set(tmr_first_activity_date):
+        candidates = [d for d in (tmr_first_summary_date.get(w), tmr_first_activity_date.get(w)) if d is not None]
+        if candidates:
+            tmr_join_date[w] = min(candidates)
 
     # ── Build a TMR→DH map from summary (more complete than activity alone) ──
     tmr_dh_from_summary = {}
@@ -533,6 +822,11 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
         date_attendance = {}
         present_count   = 0
 
+        # Build per-wallet leave date set for fast lookup
+        wallet_leaves = set()
+        if leave_map:
+            wallet_leaves = leave_map.get(wallet, set())
+
         for date in all_dates:
 
             # Fridays are always blank (holiday)
@@ -540,10 +834,15 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
                 date_attendance[date] = ""
                 continue
 
-            # Priority 1: result from granular activity-based evaluation
+            # Priority 1: approved leave overrides everything
+            if date in wallet_leaves:
+                date_attendance[date] = "L"
+                continue
+
+            # Priority 2: result from granular activity-based evaluation
             att = attendance_dict.get((wallet, date))
 
-            # Priority 2: if no activity data, fall back to summary visit count
+            # Priority 3: if no activity data, fall back to summary visit count
             if att is None:
                 srow = summary_lookup.get((wallet, date))
                 if srow is not None:
@@ -556,10 +855,18 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
             if att == "P":
                 present_count += 1
 
-        # ── Per-TMR report start date from the first available summary date ──
-        tmr_report_start = tmr_first_summary_date.get(wallet)
-        if pd.isna(tmr_report_start):
+        # ── Per-TMR report start date (join date) = first available date
+        #    across activity + summary data ──
+        tmr_report_start = tmr_join_date.get(wallet)
+        if tmr_report_start is None or pd.isna(tmr_report_start):
             tmr_report_start = report_start
+
+        # ── Per-TMR working days / Friday count, counted from THIS TMR's
+        #    own join date to the report end — NOT the global report range.
+        #    A TMR who joined mid-month sees fewer Fridays / working days
+        #    than one who was present for the whole period. ──
+        tmr_mtd_work_days = count_working_days(tmr_report_start, report_end)
+        tmr_friday_count  = count_fridays(tmr_report_start, report_end)
 
         # ── KPI metrics ──
         mkt_hr_target_sec = MARKET_HOUR_TARGET_H * 3600
@@ -571,10 +878,13 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
         strike_achieve = min(avg_strike / daily_target, 1.0) if daily_target else 0
 
         # Attendance %
-        att_pct = present_count / mtd_work_days if mtd_work_days else 0
+        att_pct = present_count / tmr_mtd_work_days if tmr_mtd_work_days else 0
 
         # Payable days = Present (approved leave not tracked here)
         payable = present_count
+
+        # ── Approved leave count (non-Friday leave days in report period) ──
+        approved_leave = len([d for d in wallet_leaves if d in set(all_dates)])
 
         # ── Assemble the row ──
         row_dict = {
@@ -583,12 +893,13 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
             "Region":                       info.get("region", ""),
             "DH Code":                      dh_code,
             "Distributor House Name":       info.get("distributor_house_name", ""),
+            "Market type":                  dh_mtype_map.get(dh_code, ""),
             "Daily visit target":           daily_target,
             "Weekly agent coverage target": weekly_coverage_target,
             "Report Start Date":            tmr_report_start.date(),
             "Report till Date":             report_end.date(),
-            "MTD Work Day":                 mtd_work_days,
-            "Friday Count":                 friday_count,
+            "MTD Work Day":                 tmr_mtd_work_days,
+            "Friday Count":                 tmr_friday_count,
             "Govt Holiday Count":           0,
             "Total Month Days":             total_month_days,
             "Market Hour Target":           seconds_to_hms(mkt_hr_target_sec),
@@ -606,8 +917,10 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
             row_dict[label] = date_attendance.get(date, "")
 
         # Summary tail columns
+        payable = present_count + approved_leave   # leave days are also payable
+        att_pct = present_count / tmr_mtd_work_days if tmr_mtd_work_days else 0
         row_dict["Present"]                  = present_count
-        row_dict["Approved Leave"]           = 0
+        row_dict["Approved Leave"]           = approved_leave
         row_dict["Payable Day"]              = payable
         row_dict["Attendance%"]              = round(att_pct,       4)
         row_dict["Market Hour Achievement"]  = round(mkt_hr_achieve, 4)
@@ -616,14 +929,15 @@ def build_report(activity_df, summary_df, dh_target_map, dh_mtype_map, log):
         rows.append(row_dict)
 
     report_df = pd.DataFrame(rows)
-    return report_df, all_dates
+    return report_df, all_dates, activity_df
 
 
 # =============================================================================
 # SECTION 6: EXCEL WRITER
 # =============================================================================
 
-def write_excel_report(report_df, all_dates, output_path, log):
+def write_excel_report(report_df, all_dates, output_path, log,
+                       salary_map=None, report_end_date=None, activity_df=None):
     """
     Write the final formatted Excel report.
 
@@ -642,7 +956,7 @@ def write_excel_report(report_df, all_dates, output_path, log):
     # ── Determine column order ──
     fixed_front = [
         "TMR Wallet", "TMR Name", "Region", "DH Code", "Distributor House Name",
-        "Daily visit target", "Weekly agent coverage target",
+        "Market type", "Daily visit target", "Weekly agent coverage target",
         "Report Start Date", "Report till Date",
         "MTD Work Day", "Friday Count", "Govt Holiday Count", "Total Month Days",
         "Market Hour Target", "Average Work Time", "Average Strike",
@@ -705,12 +1019,15 @@ def write_excel_report(report_df, all_dates, output_path, log):
 
             # ── Cell-specific styling ──
             if col_name in date_col_set:
-                # Attendance cells: color-coded P/A or gray for blank/Friday
+                # Attendance cells: color-coded P/A/L or gray for blank/Friday
                 if value == "P":
                     cell.fill = present_fill
                     cell.font = Font(name="Arial", bold=True, color=C_WHITE, size=9)
                 elif value == "A":
                     cell.fill = absent_fill
+                    cell.font = Font(name="Arial", bold=True, color=C_WHITE, size=9)
+                elif value == "L":
+                    cell.fill = PatternFill("solid", fgColor="FF8C00")   # orange = Leave
                     cell.font = Font(name="Arial", bold=True, color=C_WHITE, size=9)
                 else:
                     cell.fill = gray_fill
@@ -747,8 +1064,324 @@ def write_excel_report(report_df, all_dates, output_path, log):
         else:
             ws.column_dimensions[col_letter].width = max(len(col_name) + 2, 12)
 
+    # ── Salary Sheet (if salary data was provided) ──
+    if salary_map and report_end_date:
+        write_salary_sheet(wb, report_df, salary_map, report_end_date, activity_df, log)
+
     wb.save(output_path)
     log(f"\n  ✓ Report saved → {output_path}")
+
+
+def write_salary_sheet(wb, report_df, salary_map, report_end_date, activity_df, log):
+    """
+    Add a 'Salary Sheet' worksheet to the already-open openpyxl Workbook (wb).
+
+    Columns (matching the sample SalarySheet):
+      A  TMR Wallet
+      B  TMR Name
+      C  Region
+      D  DH Code
+      E  Distributor House Name
+      F  Market type
+      G  Minimum visit for attendance  (daily_target × 75%)
+      H  MTD Work Day
+      I  Present Day
+      J  Friday Count
+      K  Govt Holiday Count
+      L  Total Payable Day             = Present + Approved Leave + Govt Holiday
+      M  Attendance%                   = min(Present / MTD Work Day, 1)
+      N  Daily visit target
+      O  Average Strike
+      P  Strike Rate Achievement%      = min(Avg Strike / Daily Target, 1)
+      Q  Monthly agent coverage target = Daily Target × 6 × weeks-in-month
+      R  Frequency Wise Achievement%   = min(total_visits / Monthly Coverage, 1)
+      S  Market Hour Target            (H:MM:SS text)
+      T  Average Work Time             (H:MM:SS text)
+      U  Market Hour Achievement%      = min(Avg Work / Market Hour Target, 1)
+      V  Variable KPI Achievement      = P×0.35 + R×0.40 + U×0.25
+      W  Fixed salary
+      X  Variable salary
+      Y  Total salary
+      Z  Internet charge               (flat 300)
+      AA Cashout Charge                = Total salary × 1%
+      AB Final Disbursement Amount     = Total + Internet + Cashout
+      AC Remarks
+      AD Salary Status
+
+    Row 1: KPI weight labels (P1=0.35, R1=0.40, U1=0.25) + SUBTOTAL summaries
+    Row 2: Column headers
+    Row 3+: One row per TMR
+    """
+    log("  Writing Salary Sheet…")
+
+    ws = wb.create_sheet(title="Salary Sheet")
+
+    # ── Style helpers (reuse brand palette already imported in write_excel_report) ──
+    header_fill  = PatternFill("solid", fgColor=C_BLUE)
+    yellow_fill  = PatternFill("solid", fgColor=C_YELLOW)
+    alt_fill     = PatternFill("solid", fgColor=C_LIGHT)
+    white_fill   = PatternFill("solid", fgColor=C_WHITE)
+    green_fill   = PatternFill("solid", fgColor=C_GREEN)
+
+    hdr_font      = Font(name="Arial", bold=True, color=C_WHITE,  size=9)
+    data_font     = Font(name="Arial",             color="000000", size=9)
+    bold_font     = Font(name="Arial", bold=True,  color="000000", size=9)
+    subtotal_font = Font(name="Arial", bold=True,  color="000000", size=9)
+
+    thin_side   = Side(border_style="thin", color="BBBBBB")
+    cell_border = Border(left=thin_side, right=thin_side,
+                         top=thin_side,  bottom=thin_side)
+    c_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    c_left   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    c_right  = Alignment(horizontal="right",  vertical="center")
+
+    SALARY_COLS = [
+        "TMR Wallet", "TMR Name", "Region", "DH Code", "Distributor House Name",
+        "Market type", "Minimum_visit_for_attendance",
+        "MTD Work Day", "Present Day", "Approved Leave", "Friday Count", "Govt Holiday Count",
+        "Total Payable Day", "Attendance%",
+        "Daily visit target", "Average Strike", "Strike Rate Achievement%",
+        "Monthly agent coverage target", "Frequency Wise Achievement%",
+        "Market Hour Target", "Average Work Time", "Market hour Achievement%",
+        "Variable KPI Achievement",
+        "Fixed salary", "Variable salary", "Total salary",
+        "Internet charge", "Cashout Charge", "Final Disbursement Amount",
+        "Remarks", "Salary Status",
+    ]
+
+    # Column index helpers (1-based)
+    col_idx = {name: i + 1 for i, name in enumerate(SALARY_COLS)}
+
+    # ── ROW 1: KPI weight + subtotal row ──
+    ws.row_dimensions[1].height = 20
+
+    # KPI weights in the header of their respective columns
+    weight_row = {
+        col_idx["Strike Rate Achievement%"]:  KPI_WEIGHT_STRIKE,
+        col_idx["Frequency Wise Achievement%"]: KPI_WEIGHT_FREQUENCY,
+        col_idx["Market hour Achievement%"]:  KPI_WEIGHT_MKT_HOUR,
+    }
+    # Subtotal labels in the money columns
+    subtotal_cols = [
+        "Fixed salary", "Variable salary", "Total salary",
+        "Internet charge", "Cashout Charge", "Final Disbursement Amount",
+    ]
+    for ci in range(1, len(SALARY_COLS) + 1):
+        cell = ws.cell(row=1, column=ci)
+        if ci in weight_row:
+            cell.value = weight_row[ci]
+            cell.font  = bold_font
+            cell.alignment = c_center
+        col_name = SALARY_COLS[ci - 1]
+        if col_name in subtotal_cols:
+            # Will be filled in after data rows are written
+            pass
+        cell.border = cell_border
+
+    # ── ROW 2: Headers ──
+    ws.row_dimensions[2].height = 36
+    for ci, col_name in enumerate(SALARY_COLS, start=1):
+        cell = ws.cell(row=2, column=ci, value=col_name)
+        cell.fill      = header_fill
+        cell.font      = hdr_font
+        cell.alignment = c_center
+        cell.border    = cell_border
+
+    # ── Build a quick lookup from report_df by wallet ──
+    # report_df already has all the KPI fields we need
+    rdf = report_df.set_index("TMR Wallet")
+
+    # For frequency achievement we need total visits and monthly coverage target.
+    # Monthly coverage target = Weekly coverage target / 6 days × total working days
+    # Actually it's in report_df as "Weekly agent coverage target" (= daily × 6).
+    # The sample uses "Monthly agent coverage target" which we interpret as
+    # daily_target × 6 × number_of_weeks in the month  ≈ daily × working_days
+    # (the simpler / more common approach: daily × MTD Work Day)
+    # We'll use: monthly_coverage = daily_target × mtd_work_days
+
+    data_rows_start = 3
+
+    # Year/month for constructing the four calendar bands used in the
+    # frequency-wise achievement calculation (assumes a single-month report
+    # period, same assumption the rest of the report already makes).
+    report_end_ts = pd.Timestamp(report_end_date) if report_end_date is not None else None
+    band_year  = report_end_ts.year  if report_end_ts is not None else None
+    band_month = report_end_ts.month if report_end_ts is not None else None
+
+    for ri, (_, row) in enumerate(report_df.iterrows(), start=data_rows_start):
+        base_fill = alt_fill if ri % 2 == 0 else white_fill
+
+        wallet   = row["TMR Wallet"]
+        region   = str(row.get("Region", ""))
+        sal_info = salary_map.get(region.lower(), {})
+
+        # --- pull KPI values from report_df ---
+        mtd_work_day   = int(row.get("MTD Work Day", 0) or 0)
+        present_day    = int(row.get("Present", 0) or 0)
+        friday_count   = int(row.get("Friday Count", 0) or 0)
+        govt_holiday   = int(row.get("Govt Holiday Count", 0) or 0)
+        daily_target   = int(row.get("Daily visit target", 30) or 30)
+        avg_strike     = float(row.get("Average Strike", 0) or 0)
+        avg_work_time  = str(row.get("Average Work Time", "0:00:00") or "0:00:00")
+        mkt_hr_target  = str(row.get("Market Hour Target", "8:00:00") or "8:00:00")
+
+        # Derived
+        approved_leave        = int(row.get("Approved Leave", 0) or 0)
+        min_visit_for_att     = int(daily_target * MIN_VISIT_ACHIEVE)
+        total_payable_day     = present_day + approved_leave + govt_holiday + friday_count
+        attendance_pct        = min(present_day / mtd_work_day, 1.0) if mtd_work_day else 0
+        strike_rate_ach       = min(avg_strike / daily_target, 1.0) if daily_target else 0
+        weekly_cov_target     = int(row.get("Weekly agent coverage target", daily_target * 6) or daily_target * 6)
+
+        # ── Frequency Wise Achievement (weekly unique agent visits) ──
+        # Split month into 4 fixed bands: day 1-7, 8-14, 15-21, 22-28.
+        # Each TMR's effective range within a band is trimmed to start at
+        # their join date (first date seen in activity/summary data), and
+        # the weekly target for that band is daily_target × non-Friday days
+        # remaining in the (possibly trimmed) band — not a flat daily×6.
+        # Bands that fall entirely before the TMR joined are skipped and
+        # excluded from the average. Final score = average of existing bands.
+        tmr_join_date = pd.Timestamp(row.get("Report Start Date")) if row.get("Report Start Date") else None
+        freq_ach = compute_weekly_freq_achievement(
+            activity_df,
+            normalize_wallet(wallet),
+            daily_target,
+            tmr_join_date,
+            band_year,
+            band_month,
+            report_end_date=report_end_ts,
+        )
+
+        # ── Market Hour Achievement ──
+        # Rule: if avg work time < 8 h target → score = 0
+        #       if avg work time ≥ 8 h target → actual ÷ 8 h  (capped at 1)
+        avg_work_sec  = hms_to_seconds(avg_work_time)
+        mkt_hr_sec    = MARKET_HOUR_TARGET_H * 3600          # 7 h = 25 200 s
+        if avg_work_sec < mkt_hr_sec:
+            mkt_hr_ach = 0.0
+        else:
+            mkt_hr_ach = min(avg_work_sec / mkt_hr_sec, 1.0)
+
+        # Variable KPI
+        variable_kpi  = (strike_rate_ach * KPI_WEIGHT_STRIKE
+                         + freq_ach      * KPI_WEIGHT_FREQUENCY
+                         + mkt_hr_ach    * KPI_WEIGHT_MKT_HOUR)
+
+        # Salary calculations
+        daily_fixed    = sal_info.get("daily_fixed",    0)
+        daily_variable = sal_info.get("daily_variable", 0)
+        total_salary   = sal_info.get("total_salary",   0)
+
+        fixed_salary    = total_payable_day * daily_fixed
+        variable_salary = variable_kpi * total_payable_day * daily_variable
+        total_sal_earned = fixed_salary + variable_salary
+        internet_charge  = INTERNET_CHARGE
+        cashout_charge   = total_sal_earned * CASHOUT_CHARGE_PCT
+        final_disbursement = total_sal_earned + internet_charge + cashout_charge
+
+        market_type = str(row.get("Market type", sal_info.get("region_display", "")))
+        # Market type may not be in report_df — try to get from dh_mtype_map via dh_code
+        # (it will be passed in if available, otherwise left as empty string)
+
+        values = {
+            "TMR Wallet":                   wallet,
+            "TMR Name":                     row.get("TMR Name", ""),
+            "Region":                       region,
+            "DH Code":                      row.get("DH Code", ""),
+            "Distributor House Name":       row.get("Distributor House Name", ""),
+            "Market type":                  str(row.get("Market type", "") or ""),
+            "Minimum_visit_for_attendance": min_visit_for_att,
+            "MTD Work Day":                 mtd_work_day,
+            "Present Day":                  present_day,
+            "Friday Count":                 friday_count,
+            "Govt Holiday Count":           govt_holiday,
+            "Total Payable Day":            total_payable_day,
+            "Approved Leave":               approved_leave,
+            "Attendance%":                  round(attendance_pct, 4),
+            "Daily visit target":           daily_target,
+            "Average Strike":               round(avg_strike, 2),
+            "Strike Rate Achievement%":     round(strike_rate_ach, 4),
+            "Monthly agent coverage target": weekly_cov_target,
+            "Frequency Wise Achievement%":  round(freq_ach, 4),
+            "Market Hour Target":           mkt_hr_target,
+            "Average Work Time":            avg_work_time,
+            "Market hour Achievement%":     round(mkt_hr_ach, 4),
+            "Variable KPI Achievement":     round(variable_kpi, 4),
+            "Fixed salary":                 round(fixed_salary, 2),
+            "Variable salary":              round(variable_salary, 2),
+            "Total salary":                 round(total_sal_earned, 2),
+            "Internet charge":              internet_charge,
+            "Cashout Charge":               round(cashout_charge, 2),
+            "Final Disbursement Amount":    round(final_disbursement, 2),
+            "Remarks":                      "",
+            "Salary Status":                "",
+        }
+
+        for ci, col_name in enumerate(SALARY_COLS, start=1):
+            val  = values.get(col_name, "")
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.border    = cell_border
+            cell.font      = data_font
+            cell.alignment = c_center
+
+            # Formatting per column type
+            if col_name in ("Attendance%", "Strike Rate Achievement%",
+                            "Frequency Wise Achievement%", "Market hour Achievement%",
+                            "Variable KPI Achievement"):
+                cell.number_format = "0.00%"
+                cell.fill = base_fill
+            elif col_name in ("Fixed salary", "Variable salary", "Total salary",
+                              "Internet charge", "Cashout Charge",
+                              "Final Disbursement Amount"):
+                cell.number_format = "#,##0.00"
+                cell.fill = yellow_fill
+                cell.font = bold_font
+            elif col_name == "Final Disbursement Amount":
+                cell.fill = green_fill
+                cell.font = Font(name="Arial", bold=True, color=C_WHITE, size=9)
+            elif col_name in ("TMR Name", "Distributor House Name", "Region"):
+                cell.fill      = base_fill
+                cell.alignment = c_left
+            else:
+                cell.fill = base_fill
+
+    # ── ROW 1: subtotal values (sum of data column) ──
+    last_data_row = data_rows_start + len(report_df) - 1
+    for col_name in subtotal_cols:
+        ci   = col_idx[col_name]
+        col_letter = get_column_letter(ci)
+        cell = ws.cell(row=1, column=ci)
+        cell.value         = f"=SUM({col_letter}{data_rows_start}:{col_letter}{last_data_row})"
+        cell.number_format = "#,##0.00"
+        cell.font          = subtotal_font
+        cell.alignment     = c_right
+        cell.fill          = PatternFill("solid", fgColor=C_YELLOW)
+        cell.border        = cell_border
+
+    # ── Column widths ──
+    col_widths = {
+        "TMR Wallet": 15, "TMR Name": 24, "Region": 14,
+        "DH Code": 14, "Distributor House Name": 26, "Market type": 12,
+        "Minimum_visit_for_attendance": 14, "MTD Work Day": 10,
+        "Present Day": 10, "Approved Leave": 12, "Friday Count": 10, "Govt Holiday Count": 10,
+        "Total Payable Day": 10, "Attendance%": 11,
+        "Daily visit target": 10, "Average Strike": 10,
+        "Strike Rate Achievement%": 14, "Monthly agent coverage target": 14,
+        "Frequency Wise Achievement%": 14,
+        "Market Hour Target": 12, "Average Work Time": 12,
+        "Market hour Achievement%": 14, "Variable KPI Achievement": 14,
+        "Fixed salary": 14, "Variable salary": 14, "Total salary": 14,
+        "Internet charge": 12, "Cashout Charge": 12,
+        "Final Disbursement Amount": 18,
+        "Remarks": 16, "Salary Status": 14,
+    }
+    for ci, col_name in enumerate(SALARY_COLS, start=1):
+        ws.column_dimensions[get_column_letter(ci)].width = col_widths.get(col_name, 12)
+
+    # Freeze panes: column C, row 3 (header + subtotal row locked)
+    ws.freeze_panes = "C3"
+
+    log(f"  ✓ Salary Sheet added ({len(report_df)} rows)")
 
 
 # =============================================================================
@@ -800,8 +1433,10 @@ class TMRReportApp(tk.Tk):
         # ── State ──
         self.activity_files = []     # list of selected Daily Activity paths
         self.summary_files  = []     # list of selected Datewise Summary paths
-        self.dh_target_file = tk.StringVar()
-        self.output_file    = tk.StringVar()
+        self.dh_target_file  = tk.StringVar()
+        self.salary_file     = tk.StringVar()
+        self.leave_file      = tk.StringVar()
+        self.output_file     = tk.StringVar()
 
         self._build_ui()
         self._center_window()
@@ -873,8 +1508,36 @@ class TMRReportApp(tk.Tk):
         )
         self.dh_label.pack(side="left", padx=8, fill="x", expand=True)
 
-        # ── Section 4: Output File ──
-        self._section_label(content, "4", "Output Report File",
+        # ── Section 4: Region Wise Salary File ──
+        self._section_label(content, "4", "Region Wise Salary File",
+                            "(Single file — columns: Region, Total Salary)")
+
+        sal_row = tk.Frame(content, bg=self.BG)
+        sal_row.pack(fill="x", pady=(0, 4))
+        self._btn(sal_row, "Browse", self._browse_salary, primary=True)
+        self.sal_label = tk.Label(
+            sal_row, textvariable=self.salary_file,
+            bg=self.BG, fg=self.SUBTEXT, font=("Arial", 9),
+            anchor="w", wraplength=500,
+        )
+        self.sal_label.pack(side="left", padx=8, fill="x", expand=True)
+
+        # ── Section 5: Leave Status File (optional) ──
+        self._section_label(content, "5", "TMR Leave Status File",
+                            "(Optional — columns: Wallet Number, Leave Start Day, Leave End Day)")
+
+        leave_row = tk.Frame(content, bg=self.BG)
+        leave_row.pack(fill="x", pady=(0, 4))
+        self._btn(leave_row, "Browse", self._browse_leave, primary=True)
+        self.leave_label = tk.Label(
+            leave_row, textvariable=self.leave_file,
+            bg=self.BG, fg=self.SUBTEXT, font=("Arial", 9),
+            anchor="w", wraplength=500,
+        )
+        self.leave_label.pack(side="left", padx=8, fill="x", expand=True)
+
+        # ── Section 6: Output File ──
+        self._section_label(content, "6", "Output Report File",
                             "(Choose where to save the generated Excel report)")
 
         out_row = tk.Frame(content, bg=self.BG)
@@ -1000,6 +1663,26 @@ class TMRReportApp(tk.Tk):
             self.dh_target_file.set(path)
             self.log(f"DH target file: {os.path.basename(path)}")
 
+    def _browse_salary(self):
+        """Open a single-file dialog for the Region Wise Salary file."""
+        path = filedialog.askopenfilename(
+            title="Select Region Wise Salary File",
+            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")],
+        )
+        if path:
+            self.salary_file.set(path)
+            self.log(f"Salary file: {os.path.basename(path)}")
+
+    def _browse_leave(self):
+        """Open a single-file dialog for the Leave Status file."""
+        path = filedialog.askopenfilename(
+            title="Select TMR Leave Status File",
+            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")],
+        )
+        if path:
+            self.leave_file.set(path)
+            self.log(f"Leave file: {os.path.basename(path)}")
+
     def _browse_output(self):
         """Open a save-as dialog to choose the output report path."""
         path = filedialog.asksaveasfilename(
@@ -1085,17 +1768,35 @@ class TMRReportApp(tk.Tk):
             log("Loading DH Wise Target file…")
             dh_target_map, dh_mtype_map = load_dh_targets(self.dh_target_file.get(), log)
 
+            # ── Load leave data (optional) ──
+            leave_map = None
+            if self.leave_file.get():
+                log("Loading Leave Status file…")
+                leave_map = load_leave_file(self.leave_file.get(), log)
+
             # ── Build report ──
             log("Building report…")
-            report_df, all_dates = build_report(
-                activity_df, summary_df, dh_target_map, dh_mtype_map, log
+            report_df, all_dates, activity_df_built = build_report(
+                activity_df, summary_df, dh_target_map, dh_mtype_map, log,
+                leave_map=leave_map,
             )
 
             log(f"  → {len(report_df)} TMRs | {len(all_dates)} date columns")
 
+            # ── Load salary data (optional) ──
+            salary_map = None
+            report_end_date = all_dates[-1] if all_dates else None
+            if self.salary_file.get():
+                log("Loading Region Wise Salary file…")
+                salary_map = load_salary_file(
+                    self.salary_file.get(), report_end_date, log
+                )
+
             # ── Write Excel ──
             log("Writing Excel output…")
-            write_excel_report(report_df, all_dates, self.output_file.get(), log)
+            write_excel_report(report_df, all_dates, self.output_file.get(), log,
+                               salary_map=salary_map, report_end_date=report_end_date,
+                               activity_df=activity_df_built)
 
             log("✓ Done!", "ok")
             log(f"  File: {self.output_file.get()}", "ok")
